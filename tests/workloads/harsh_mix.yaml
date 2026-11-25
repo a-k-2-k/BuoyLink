@@ -1,0 +1,48 @@
+# Harsh mix: 3 hours of buoy time. Routine bursts, alarms, a loss burst on
+# one buoy, a blackout on another, a backhaul blackout, and a lossy patch for
+# everyone. Times in buoy seconds.
+id: harsh_mix
+seed: 7
+time_unit: claimed
+duration_s: 10800
+drain_s: 900
+
+flows:
+  - pattern: burst
+    src: "sender*"
+    dst: receiver0
+    direction: uplink
+    start_s: 60
+    gap_min_s: 240
+    gap_max_s: 600
+    msgs_per_burst: 4
+    msg_bytes: 32
+    duration_s: 10500
+    deadline_s: 300
+  - pattern: burst              # bigger, spread-out bursts
+    src: "sender[0-1]"
+    dst: receiver0
+    direction: uplink
+    start_s: 900
+    gap_min_s: 900
+    gap_max_s: 1800
+    msgs_per_burst: 8
+    intra_burst_gap_s: 5
+    msg_bytes: 32
+    duration_s: 9000
+    deadline_s: 300
+  - pattern: poisson
+    src: "sender*"
+    dst: receiver0
+    direction: alarm
+    mean_interval_s: 1200
+    duration_s: 10500
+    msg_bytes: 8
+    deadline_s: 30
+
+events:
+  - {t_s: 1800, kind: loss_burst, target: "sender0-radio", loss_pct: 30, duration_s: 900}
+  - {t_s: 3600, kind: blackout, target: "sender1-radio", duration_s: 600}
+  - {t_s: 5400, kind: blackout, target: "radio-receiver0", duration_s: 300}
+  - {t_s: 7200, kind: loss_burst, target: "sender*-radio", loss_pct: 20, duration_s: 1200}
+  - {t_s: 9000, kind: delay_change, target: "sender2-radio", delay_ms: 30, jitter_ms: 10, duration_s: 900}
