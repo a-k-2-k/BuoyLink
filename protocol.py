@@ -12,16 +12,22 @@ Sender (buoy)
     datagram. Alarms (short deadlines) are sent at once, and carry waiting
     routine readings along only while the datagram stays small enough for a
     retry to still beat the alarm's deadline.
-  * Compact framing. 1 byte datagram sequence number, then the first message
-    id as a varint, then entries: usually one byte per message (id delta, and
+  * Compact framing. 1 byte: a 7 bit datagram sequence number, plus a flag
+    saying whether the first message id is sent as just its low byte (the
+    receiver can tell which id that is from the ones it has seen; otherwise
+    the full id follows as a varint). Then entries: usually one byte per message (id delta, and
     the length only when it changes), and a single byte for a run of
     consecutive ids. Messages too big for one datagram are fragmented.
-  * Reliability. Every datagram gets one small ACK. Lost datagrams are found
-    from gaps in the ACK bitmap, or by timeout. On a routine timeout we first
-    send an empty "poll" datagram (29 bytes on the wire) instead of resending
-    the whole batch: if only the ACK was lost, that is much cheaper. Alarms are
-    resent directly, early enough to make their deadline, and sent twice when
-    the link looks lossy.
+  * Reliability. Every routine datagram gets one small ACK. Lost datagrams
+    are found from gaps in the ACK bitmap, or by timeout. On a routine timeout
+    we first send an empty "poll" datagram (29 bytes on the wire) instead of
+    resending the whole batch: if only the ACK was lost, that is much cheaper.
+  * Alarms. When the link looks healthy (low estimated loss), an alarm goes
+    alone and "lazy": the receiver doesn't ACK it by itself, and the next
+    routine ACK's bitmap confirms it. That saves a 29 byte ACK per 8 byte
+    alarm, at the cost of a lost alarm being resent late. When the link looks
+    lossy, alarms ask for an ACK, are resent early enough to make their
+    deadline, and are sent twice when loss is very high.
   * Exponential backoff during outages, with polls instead of data, so a
     blackout costs a few tiny datagrams rather than repeated full batches.
   * Pacing. Routine datagrams are spaced by their airtime so an alarm never
@@ -53,7 +59,7 @@ MAX_DGRAM = 300          # cap our datagrams so an alarm never waits long behind
 ALARM_DGRAM = 80         # an alarm only carries other readings up to this size, so a
                          # lost one can still be resent inside its deadline
 DEFAULT_LEN = 32         # routine reading size; entries of this size skip the length
-IDLE_GAP_S = 0.5         # with a decent batch, flush once arrivals go quiet this long
+IDLE_GAP_S = 0.35        # with a decent batch, flush once arrivals go quiet this long
 MIN_BATCH_BYTES = 100    # ... "decent" = this much payload waiting
 MAX_HOLD_S = 3.0         # never hold a routine reading longer than this
 HOLD_RESERVE_S = 1.5     # ... and leave this much of its deadline for retries
@@ -66,6 +72,8 @@ BACKOFF = 1.6
 OUTAGE_TIMEOUTS = 3      # this many timeouts in a row = assume an outage, send polls only
 ALARM_RETRY_MIN_S = 0.08
 LOSSY = 0.30             # above this estimated loss, alarms are sent twice
+LAZY_LOSS = 0.08         # below this estimated loss, alarms go without asking for an ACK
+LAZY_CONFIRM_S = 12.0    # a lazy datagram is confirmed by a later ACK; poll if none by then
 INF = float("inf")
 
 
@@ -131,9 +139,10 @@ def live_alarm(u, now):
 class Dgram:
     """A data datagram (or poll) waiting for its ACK."""
 
-    __slots__ = ("seq", "sent", "units", "alarm", "expires", "expected")
+    __slots__ = ("seq", "sent", "units", "alarm", "expires", "expected", "lazy")
 
-    def __init__(self, seq, sent, units, alarm, expires, expected):
+    def __init__(self, seq, sent, units, alarm, expires, expected, lazy=False):
+        self.lazy = lazy              # sent without asking for an ACK
         self.seq = seq
         self.sent = sent
         self.units = units
@@ -155,6 +164,8 @@ class BuoySender(Sender):
         self.loss = 0.05         # EWMA of datagram loss
         self.next_free = 0.0     # when our radio is free again (pacing)
         self.last_arrival = 0.0
+        self.acked_max_id = -1   # highest msg id the receiver has confirmed
+        self.sent_max_id = -1    # highest msg id we have ever sent
         self.stats = {"data": 0, "alarm": 0, "poll": 0, "bytes": 0, "units": 0,
                       "resent_units": 0, "timeouts": 0, "gaps": 0}
 
@@ -211,7 +222,10 @@ class BuoySender(Sender):
         self.backoff += 1
         self.stats["timeouts"] += len(expired)
         for d in expired:
-            if d.alarm:
+            if d.lazy:
+                # Never confirmed by a later ACK: ask.
+                d.expires = INF
+            elif d.alarm:
                 # Alarm: no time to ask. Resend what it carried.
                 del self.inflight[d.seq]
                 self._note_loss(True)
@@ -251,7 +265,9 @@ class BuoySender(Sender):
                 got_any = True
                 self._note_loss(False)
                 sample = max(0.0, now - d.sent - d.expected)
-                if self.srtt is None:
+                if d.lazy:
+                    pass
+                elif self.srtt is None:
                     self.srtt, self.rttvar = sample, sample / 2
                 else:
                     self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.srtt - sample)
@@ -259,6 +275,8 @@ class BuoySender(Sender):
                 for u in d.units:
                     u.inflight -= 1
                     self.units.pop(u.key, None)
+                    if u.msg_id > self.acked_max_id:
+                        self.acked_max_id = u.msg_id
             elif seq < h:
                 # Links are FIFO: a later datagram arrived and this one did not.
                 self.stats["gaps"] += 1
@@ -281,9 +299,10 @@ class BuoySender(Sender):
                  "loss_est", round(self.loss, 3))
 
     def _full_seq(self, low):
-        # The newest sent datagram whose low byte matches.
-        for seq in range(self.next_seq - 1, max(-1, self.next_seq - 257), -1):
-            if seq & 0xFF == low:
+        # The newest sent datagram whose low 6 bits match.
+        low &= 0x3F
+        for seq in range(self.next_seq - 1, max(-1, self.next_seq - 65), -1):
+            if seq & 0x3F == low:
                 return seq
         return None
 
@@ -352,9 +371,15 @@ class BuoySender(Sender):
     def _send_now(self, alarm):
         now = self.now()
         self._order(now)
+        # Lazy alarm: when the link looks healthy, send the alarm alone and let
+        # the next routine ACK confirm it (its bitmap covers the last 8).
+        lazy = (alarm and self.loss < LAZY_LOSS and self.backoff == 0
+                and not any(d.expires == INF for d in self.inflight.values()))
         cap = ALARM_DGRAM if alarm else MAX_DGRAM
         chosen, size = [], 1 + 4
         for u in self.pending:
+            if lazy and not live_alarm(u, now):
+                continue
             add = len(u.data) + 4 + (6 if u.is_frag else 0)
             if chosen and size + add > cap and not live_alarm(u, now):
                 continue
@@ -366,17 +391,19 @@ class BuoySender(Sender):
             self.pending.remove(u)
         copies = 2 if alarm and self.loss > LOSSY else 1
         for _ in range(copies):
-            self._transmit(chosen, alarm, now)
+            self._transmit(chosen, alarm, now, lazy)
 
     def _send_poll(self):
         if self.dst is None:
             return
         self._transmit([], False, self.now())
 
-    def _transmit(self, units, alarm, now):
+    def _transmit(self, units, alarm, now, lazy=False):
         seq = self.next_seq
         self.next_seq += 1
-        pkt = self._encode(seq, units)
+        pkt = self._encode(seq, units, self._short_ok(units), lazy)
+        if units:
+            self.sent_max_id = max(self.sent_max_id, max(u.msg_id for u in units))
         self.send_datagram(pkt, to=self.dst)
         st = self.stats
         st["poll" if not units else "alarm" if alarm else "data"] += 1
@@ -398,12 +425,30 @@ class BuoySender(Sender):
             if deadline is not None:
                 rto = min(rto, max(ALARM_RETRY_MIN_S, (deadline - now) * 0.4))
             rto = max(rto, 1.3 * expected + 0.02)
-        self.inflight[seq] = Dgram(seq, now, list(units), alarm, now + rto, expected)
+        if lazy:
+            rto = LAZY_CONFIRM_S
+        self.inflight[seq] = Dgram(seq, now, list(units), alarm, now + rto, expected, lazy)
         self._arm_rto()
 
+    def _short_ok(self, units):
+        """Can the first msg id go as its low byte alone?
+
+        The receiver rebuilds it from the highest id it has seen from us, R,
+        which lies somewhere in [acked_max_id, sent_max_id]. The low byte is
+        unambiguous if the id is within 127 of every possible R.
+        """
+        if not units or self.acked_max_id < 0:
+            return False
+        base = min(u.msg_id for u in units)
+        return (base - self.acked_max_id <= 127 and
+                max(self.sent_max_id, base) - base <= 127 and
+                self.acked_max_id - base <= 127)
+
     @staticmethod
-    def _encode(seq, units):
-        """seq byte, first msg id, then entries. Entry = varint X, where
+    def _encode(seq, units, short=False, lazy=False):
+        """seq byte (6 bit seq; bit 7 = first id is short; bit 6 = lazy, don't
+        ACK this one by itself), first msg id
+        (its low byte, or a full varint), then entries. Entry = varint X, where
         X = (n << 2) | kind:
           kind 0: one message, id = prev + n, same length as the previous one
           kind 1: one message, id = prev + n, a varint length follows
@@ -411,12 +456,15 @@ class BuoySender(Sender):
           kind 3: n more messages, each id = prev + 1 and the previous length
         Payload bytes follow each entry (all of a run's payloads, back to back).
         """
-        out = bytearray([seq & 0xFF])
+        out = bytearray([(seq & 0x3F) | (0x80 if short else 0) | (0x40 if lazy else 0)])
         if not units:
             return bytes(out)
         units = sorted(units, key=lambda u: (u.msg_id, u.offset))
         base = units[0].msg_id
-        put_varint(out, base)
+        if short:
+            out.append(base & 0xFF)
+        else:
+            put_varint(out, base)
         prev_id, prev_len = base, DEFAULT_LEN
         i = 0
         while i < len(units):
@@ -432,7 +480,10 @@ class BuoySender(Sender):
                 prev_id = u.msg_id
                 i += 1
                 continue
-            if n == prev_len:
+            last = i == len(units) - 1
+            if n == prev_len or (last and n < prev_len):
+                # Same length as before, or the last entry and shorter than
+                # that: the receiver takes the rest of the datagram.
                 put_varint(out, delta << 2)
             else:
                 put_varint(out, (delta << 2) | 1)
@@ -459,11 +510,12 @@ class BuoySender(Sender):
 # Receiver
 # ---------------------------------------------------------------------------
 class PeerState:
-    __slots__ = ("highest", "seen", "frags")
+    __slots__ = ("highest", "seen", "frags", "max_id")
 
     def __init__(self):
         self.highest = -1
         self.seen = set()
+        self.max_id = -1         # highest msg id decoded from this sender
         self.frags = {}          # msg_id -> {offset: bytes}
 
 
@@ -475,7 +527,7 @@ class ShoreReceiver(Receiver):
         if not data:
             return
         st = self.peers_state.setdefault(addr, PeerState())
-        seq = self._full_seq(st, data[0])
+        seq = self._full_seq(st, data[0] & 0x3F)
         st.seen.add(seq)
         if seq > st.highest:
             st.highest = seq
@@ -486,21 +538,28 @@ class ShoreReceiver(Receiver):
             self._unpack(st, data)
         except IndexError:
             pass  # truncated datagram: deliver what we could, still ACK
-        self._ack(st, addr)
+        if not data[0] & 0x40:
+            self._ack(st, addr)       # lazy datagrams are confirmed by the next ACK
 
     @staticmethod
     def _full_seq(st, low):
         if st.highest < 0:
             return low
-        guess = (st.highest & ~0xFF) | low
+        guess = (st.highest & ~0x3F) | low
         # Pick the candidate closest to highest.
-        best = min((guess - 256, guess, guess + 256), key=lambda s: abs(s - st.highest))
-        return best
+        return min((guess - 64, guess, guess + 64), key=lambda s: abs(s - st.highest))
 
     def _unpack(self, st, data):
         if len(data) == 1:
             return  # a poll
-        msg_id, i = get_varint(data, 1)
+        if data[0] & 0x80:
+            low = data[1]
+            ref = max(st.max_id, 0)
+            guess = (ref & ~0xFF) | low
+            msg_id = min((guess - 256, guess, guess + 256), key=lambda c: abs(c - ref))
+            i = 2
+        else:
+            msg_id, i = get_varint(data, 1)
         prev_len = DEFAULT_LEN
         while i < len(data):
             x, i = get_varint(data, i)
@@ -513,9 +572,12 @@ class ShoreReceiver(Receiver):
                     if len(chunk) != prev_len:
                         return
                     self._got(msg_id, chunk)
+                st.max_id = max(st.max_id, msg_id)
                 continue
             msg_id += n
             length = prev_len
+            if kind == 0 and len(data) - i < prev_len:
+                length = len(data) - i        # last entry, shorter than prev
             if kind in (1, 2):
                 length, i = get_varint(data, i)
             if kind == 2:
@@ -525,6 +587,7 @@ class ShoreReceiver(Receiver):
             i += length
             if len(chunk) != length:
                 return
+            st.max_id = max(st.max_id, msg_id)
             if kind == 2:
                 self._frag(st, msg_id, off, total, chunk)
             else:
@@ -552,7 +615,7 @@ class ShoreReceiver(Receiver):
             if h - 1 - i in st.seen or h - 1 - i < 0:
                 bitmap |= 1 << i
         # Nothing missing among the last 8: the bitmap byte is left off.
-        ack = bytes([h & 0xFF]) if bitmap == 0xFF else bytes([h & 0xFF, bitmap])
+        ack = bytes([h & 0x3F]) if bitmap == 0xFF else bytes([h & 0x3F, bitmap])
         self.send_datagram(ack, to=addr)
 
 

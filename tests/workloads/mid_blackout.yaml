@@ -1,0 +1,13 @@
+# Basic traffic with medium blackouts (4-7 minutes): the case where recovery
+# speed decides whether queued readings make 300 s.
+id: mid_blackout
+seed: 51
+time_unit: claimed
+duration_s: 5400
+drain_s: 900
+flows:
+  - {pattern: burst, src: "sender*", dst: receiver0, direction: uplink, start_s: 60, gap_min_s: 300, gap_max_s: 600, msgs_per_burst: 4, msg_bytes: 32, duration_s: 5200, deadline_s: 300}
+  - {pattern: poisson, src: "sender*", dst: receiver0, direction: alarm, mean_interval_s: 1800, duration_s: 5200, msg_bytes: 8, deadline_s: 30}
+events:
+  - {t_s: 1500, kind: blackout, target: "radio-receiver0", duration_s: 300}
+  - {t_s: 3300, kind: blackout, target: "sender[0-1]-radio", duration_s: 420}
