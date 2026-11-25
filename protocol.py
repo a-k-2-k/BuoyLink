@@ -72,7 +72,7 @@ BACKOFF = 1.6
 OUTAGE_TIMEOUTS = 3      # this many timeouts in a row = assume an outage, send polls only
 ALARM_RETRY_MIN_S = 0.08
 LOSSY = 0.30             # above this estimated loss, alarms are sent twice
-LAZY_LOSS = 0.08         # below this estimated loss, alarms go without asking for an ACK
+LAZY_LOSS = 0.12         # below this estimated loss, alarms go without asking for an ACK
 LAZY_CONFIRM_S = 12.0    # a lazy datagram is confirmed by a later ACK; poll if none by then
 INF = float("inf")
 
